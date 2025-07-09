@@ -243,6 +243,204 @@ class HDF5Manager:
         for key in source.keys():
             source.copy(key, dest)
             
+    def dataset_to_dataframe(self, dataset, name):
+        """Convert HDF5 dataset to pandas DataFrame"""
+        try:
+            data = dataset[:]
+            
+            # Handle different data types and shapes
+            if len(data.shape) == 0:
+                # Scalar dataset
+                df = pd.DataFrame({name: [data]})
+            elif len(data.shape) == 1:
+                # 1D dataset
+                df = pd.DataFrame({name: data})
+            elif len(data.shape) == 2:
+                # 2D dataset - use column names if available
+                if hasattr(dataset, 'attrs') and 'column_names' in dataset.attrs:
+                    column_names = dataset.attrs['column_names']
+                    if len(column_names) == data.shape[1]:
+                        df = pd.DataFrame(data, columns=column_names)
+                    else:
+                        df = pd.DataFrame(data)
+                else:
+                    df = pd.DataFrame(data)
+            else:
+                # Higher dimensions - flatten to 2D
+                reshaped_data = data.reshape(data.shape[0], -1)
+                df = pd.DataFrame(reshaped_data)
+                
+            return df
+            
+        except Exception as e:
+            # If conversion fails, create a simple info DataFrame
+            return pd.DataFrame({
+                'dataset_name': [name],
+                'shape': [str(dataset.shape)],
+                'dtype': [str(dataset.dtype)],
+                'error': [f"Conversion failed: {str(e)}"]
+            })
+            
+    def export_group_to_csv(self):
+        """Export selected group to CSV file(s)"""
+        if not self.items or self.selected_index >= len(self.items):
+            # If no items or invalid selection, check if we're in a group
+            if self.current_path != "/":
+                # We're inside a group, use current group
+                group_name = self.current_path.split("/")[-1]
+                output_path = self.get_input(f"Export current group '{group_name}' to CSV (file/dir): ")
+                if not output_path:
+                    return
+                    
+                try:
+                    source_group = self.current_file[self.current_path]
+                    self._export_group_to_csv_recursive(source_group, output_path, group_name)
+                    
+                except Exception as e:
+                    self.show_message(f"CSV export failed: {str(e)}", 4)
+            else:
+                self.show_message("No group selected and not inside a group", 4)
+            return
+            
+        item = self.items[self.selected_index]
+        name, item_type = item[0], item[1]
+        
+        if item_type == "dataset":
+            # Single dataset export (existing functionality)
+            self.export_dataset_to_csv()
+            return
+        elif item_type != "group":
+            # If not a group but we're inside a group, use current group
+            if self.current_path != "/":
+                group_name = self.current_path.split("/")[-1]
+                output_path = self.get_input(f"Export current group '{group_name}' to CSV (file/dir): ")
+                if not output_path:
+                    return
+                    
+                try:
+                    source_group = self.current_file[self.current_path]
+                    self._export_group_to_csv_recursive(source_group, output_path, group_name)
+                    
+                except Exception as e:
+                    self.show_message(f"CSV export failed: {str(e)}", 4)
+            else:
+                self.show_message("Please select a group or dataset to export", 4)
+            return
+            
+        # Group export
+        group_name = name.rstrip("/")
+        output_path = self.get_input(f"Export group '{group_name}' to CSV (file/dir): ")
+        if not output_path:
+            return
+            
+        try:
+            group_path = self.current_path.rstrip("/") + "/" + group_name
+            if self.current_path == "/":
+                group_path = "/" + group_name
+                
+            source_group = self.current_file[group_path]
+            self._export_group_to_csv_recursive(source_group, output_path, group_name)
+            
+        except Exception as e:
+            self.show_message(f"CSV export failed: {str(e)}", 4)
+            
+    def _export_group_to_csv_recursive(self, group, output_path, group_name):
+        """Recursively export group contents to CSV"""
+        # Expand user path and resolve relative paths
+        output_path = os.path.expanduser(output_path)
+        output_path = os.path.abspath(output_path)
+        
+        # Collect all datasets and subgroups
+        datasets = []
+        subgroups = []
+        
+        try:
+            for key in group.keys():
+                item = group[key]
+                if isinstance(item, h5py.Dataset):
+                    datasets.append((key, item))
+                elif isinstance(item, h5py.Group):
+                    subgroups.append((key, item))
+        except Exception as e:
+            self.show_message(f"Error reading group {group_name}: {str(e)}", 4)
+            return
+        
+        # Determine output strategy
+        if len(datasets) == 0 and len(subgroups) == 0:
+            self.show_message(f"Group '{group_name}' is empty", 4)
+            return
+        
+        exported_files = []
+        
+        # Export datasets in current group to a single CSV file
+        if datasets:
+            # Ensure output path has .csv extension for the group's datasets
+            if not output_path.endswith('.csv'):
+                csv_output_path = output_path + '.csv'
+            else:
+                csv_output_path = output_path
+            
+            try:
+                # Use a list to collect DataFrames, then concat once at the end
+                dataframes = []
+                
+                for dataset_name, dataset in datasets:
+                    try:
+                        df = self.dataset_to_dataframe(dataset, dataset_name)
+                        # Add dataset name as a column to identify source
+                        df['dataset_source'] = dataset_name
+                        dataframes.append(df)
+                    except Exception as e:
+                        # Create error info DataFrame if dataset conversion fails
+                        error_df = pd.DataFrame({
+                            'dataset_name': [dataset_name],
+                            'error': [f"Conversion failed: {str(e)}"],
+                            'dataset_source': [dataset_name]
+                        })
+                        dataframes.append(error_df)
+                
+                if dataframes:
+                    # Simple concatenation - just stack all datasets vertically
+                    # This avoids complex logic that could cause hangs
+                    combined_df = pd.concat(dataframes, ignore_index=True, sort=False)
+                    combined_df.to_csv(csv_output_path, index=False)
+                    exported_files.append(csv_output_path)
+                
+            except Exception as e:
+                self.show_message(f"Failed to export datasets from group {group_name}: {str(e)}", 4)
+        
+        # Handle subgroups - create directory structure
+        if subgroups:
+            # Create directory named after the parent group
+            if output_path.endswith('.csv'):
+                dir_path = output_path[:-4]  # Remove .csv extension
+            else:
+                dir_path = output_path
+            
+            try:
+                os.makedirs(dir_path, exist_ok=True)
+                
+                # Recursively export each subgroup
+                for subgroup_name, subgroup in subgroups:
+                    subgroup_path = os.path.join(dir_path, subgroup_name)
+                    try:
+                        self._export_group_to_csv_recursive(subgroup, subgroup_path, subgroup_name)
+                        exported_files.append(subgroup_path)
+                    except Exception as e:
+                        self.show_message(f"Failed to export subgroup {subgroup_name}: {str(e)}", 4)
+                        continue
+                        
+            except Exception as e:
+                self.show_message(f"Failed to create directory {dir_path}: {str(e)}", 4)
+        
+        if exported_files:
+            if len(datasets) > 0 and len(subgroups) > 0:
+                self.show_message(f"Exported group '{group_name}': CSV + {len(subgroups)} subgroups", 5)
+            elif len(datasets) > 0:
+                self.show_message(f"Exported {len(datasets)} datasets from '{group_name}' to CSV", 5)
+            elif len(subgroups) > 0:
+                self.show_message(f"Exported {len(subgroups)} subgroups from '{group_name}'", 5)
+            
     def export_dataset_to_csv(self):
         """Export selected dataset to CSV file"""
         if not self.items or self.selected_index >= len(self.items):
@@ -273,17 +471,7 @@ class HDF5Manager:
                 dataset_path = "/" + name
                 
             dataset = self.current_file[dataset_path]
-            data = dataset[:]
-            
-            # Convert to pandas DataFrame
-            if len(data.shape) == 1:
-                df = pd.DataFrame(data, columns=[name])
-            elif len(data.shape) == 2:
-                df = pd.DataFrame(data)
-            else:
-                # For higher dimensions, flatten or handle appropriately
-                df = pd.DataFrame(data.reshape(-1, data.shape[-1]))
-                
+            df = self.dataset_to_dataframe(dataset, name)
             df.to_csv(output_file, index=False)
             self.show_message(f"Successfully exported to: {output_file}", 5)
             
@@ -446,7 +634,7 @@ class HDF5Manager:
                 elif key == ord('e') or key == ord('E'):
                     self.export_group_to_hdf5()
                 elif key == ord('c') or key == ord('C'):
-                    self.export_dataset_to_csv()
+                    self.export_group_to_csv()  # Updated to handle both groups and datasets
                 elif key == ord('i') or key == ord('I'):
                     self.show_dataset_info()
                     
@@ -477,13 +665,16 @@ Controls:
   ↑/↓         Navigate up/down
   Enter       Enter group or navigate to parent
   e           Export selected group to HDF5 file
-  c           Export selected dataset to CSV
+  c           Export selected group/dataset to CSV
   i           Show detailed dataset information
   q           Quit application
 
 File Operations:
   - Export groups: Select a group and press 'e' to export to separate HDF5 file
-  - Export datasets: Select a dataset and press 'c' to convert to CSV
+  - Export to CSV: Select a group or dataset and press 'c' to convert to CSV
+    * Single dataset: Creates one CSV file
+    * Group with datasets: Combines all datasets into single CSV file
+    * Group with subgroups: Creates CSV for datasets + subdirectories for subgroups
   - View info: Select a dataset and press 'i' to see detailed information
         """
     )
